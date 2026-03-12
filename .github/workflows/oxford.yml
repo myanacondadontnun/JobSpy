@@ -1,0 +1,217 @@
+name: Job scrape Oxford strict
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 */6 * * *"
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -U python-jobspy pandas
+
+      - name: Run scraper
+        shell: bash
+        run: |
+          cat > scrape_jobs.py <<'PY'
+          import csv
+          import re
+          from datetime import datetime, timezone
+
+          import pandas as pd
+          from jobspy import scrape_jobs
+
+          SEARCH_TERMS = [
+              "data analyst",
+              "junior data analyst",
+              "data science trainee",
+              "data technician",
+              "it support analyst",
+              "soc analyst",
+              "cyber security technician",
+              "risk and compliance assistant",
+          ]
+
+          LOCATIONS = [
+              "Oxford, UK",
+          ]
+
+          # Strict Oxford / Oxfordshire allow-list
+          ALLOWED_LOCATION_PATTERNS = [
+              r"\boxford\b",
+              r"\boxford,\s*uk\b",
+              r"\boxford,\s*england\b",
+              r"\boxfordshire\b",
+              r"\bheadington\b",
+              r"\bcowley\b",
+              r"\bsummertown\b",
+              r"\bbotley\b",
+              r"\bbicester\b",
+              r"\babingdon\b",
+              r"\bdidcot\b",
+              r"\bwitney\b",
+              r"\bkidlington\b",
+              r"\bcarterton\b",
+              r"\bbanbury\b",
+              r"\bthame\b",
+              r"\bwantage\b",
+          ]
+
+          # Explicitly reject non-Oxford locations and vague broad locations
+          BLOCKED_LOCATION_PATTERNS = [
+              r"\blondon\b",
+              r"\bmanchester\b",
+              r"\bbirmingham\b",
+              r"\bleeds\b",
+              r"\bglasgow\b",
+              r"\bcardiff\b",
+              r"\bnewport\b",
+              r"\bswansea\b",
+              r"\breading\b",
+              r"\bcambridge\b",
+              r"\bbristol\b",
+              r"\bbath\b",
+              r"\bswindon\b",
+              r"\bmilton keynes\b",
+              r"\bluton\b",
+              r"\bnorthampton\b",
+              r"\bcoventry\b",
+              r"\bleicester\b",
+              r"\bnottingham\b",
+              r"\bsouthampton\b",
+              r"\bportsmouth\b",
+              r"\bhybrid\b",
+              r"\bremote\b",
+              r"\bremote.*uk\b",
+              r"\bunited kingdom\b",
+              r"\buk\b",
+              r"\bengland\b",
+              r"\bsouth east\b",
+              r"\bsouth east england\b",
+          ]
+
+          def normalize_text(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip().lower()
+
+          def location_allowed(location_text):
+              text = normalize_text(location_text)
+
+              if not text:
+                  return False
+
+              # If location contains Oxford or Oxfordshire-related allowed places, keep it
+              has_allowed = any(re.search(pattern, text) for pattern in ALLOWED_LOCATION_PATTERNS)
+
+              # If it contains any blocked location text, reject it
+              has_blocked = any(re.search(pattern, text) for pattern in BLOCKED_LOCATION_PATTERNS)
+
+              # Extra strictness:
+              # if Oxford appears together with another clearly different city, reject it
+              if re.search(r"\boxford\b", text):
+                  if re.search(
+                      r"\b(london|manchester|birmingham|leeds|glasgow|cardiff|newport|swansea|reading|cambridge|bristol|bath|swindon|milton keynes|luton|northampton|coventry|leicester|nottingham|southampton|portsmouth)\b",
+                      text
+                  ):
+                      return False
+                  return True
+
+              return has_allowed and not has_blocked
+
+          all_frames = []
+
+          for term in SEARCH_TERMS:
+              for location in LOCATIONS:
+                  google_query = f'"{term}" jobs near {location} since yesterday'
+
+                  try:
+                      jobs = scrape_jobs(
+                          site_name=["linkedin", "indeed", "google"],
+                          search_term=term,
+                          google_search_term=google_query,
+                          location=location,
+                          results_wanted=30,
+                          hours_old=168,
+                          country_indeed="UK",
+                          linkedin_fetch_description=False,
+                          verbose=1,
+                      )
+
+                      if jobs is not None and len(jobs) > 0:
+                          jobs["search_term"] = term
+                          jobs["search_location"] = location
+                          all_frames.append(jobs)
+
+                  except Exception as e:
+                      print(f"Failed for term={term} location={location}: {e}")
+
+          if all_frames:
+              df = pd.concat(all_frames, ignore_index=True)
+              df.columns = [str(c).lower() for c in df.columns]
+
+              location_col = None
+              for candidate in ["location", "job_location"]:
+                  if candidate in df.columns:
+                      location_col = candidate
+                      break
+
+              if location_col:
+                  before_count = len(df)
+                  df = df[df[location_col].apply(location_allowed)].copy()
+                  after_count = len(df)
+                  print(f"Location guardrail removed {before_count - after_count} rows")
+              else:
+                  # No location column means reject everything for safety
+                  print("No location column found. Returning empty dataframe for strict mode.")
+                  df = pd.DataFrame()
+
+              if not df.empty and "is_remote" in df.columns and location_col:
+                  # Strict mode rejects remote / vague non-local roles
+                  df = df[df["is_remote"] != True].copy()
+
+              if not df.empty and "job_url" in df.columns:
+                  df = df.drop_duplicates(subset=["job_url"])
+              elif not df.empty:
+                  dedupe_cols = [c for c in ["site", "title", "company", "location"] if c in df.columns]
+                  if dedupe_cols:
+                      df = df.drop_duplicates(subset=dedupe_cols)
+
+              if not df.empty:
+                  sort_cols = [c for c in ["site", "search_term", "search_location", "title", "company"] if c in df.columns]
+                  if sort_cols:
+                      df = df.sort_values(sort_cols).reset_index(drop=True)
+          else:
+              df = pd.DataFrame()
+
+          timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
+          output_file = f"jobs_oxford_strict_{timestamp}.csv"
+
+          df.to_csv(output_file, index=False, quoting=csv.QUOTE_NONNUMERIC, escapechar="\\")
+          df.to_csv("latest_jobs_oxford_strict.csv", index=False, quoting=csv.QUOTE_NONNUMERIC, escapechar="\\")
+
+          print(f"Saved {len(df)} rows to {output_file}")
+          PY
+
+          python scrape_jobs.py
+
+      - name: Upload CSV files
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraped-jobs-csv-oxford-strict
+          path: |
+            latest_jobs_oxford_strict.csv
+            jobs_oxford_strict_*.csv
