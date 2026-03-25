@@ -1,0 +1,245 @@
+name: Job scrape Swindon strict
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9 */3 * *"
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -U python-jobspy pandas
+
+      - name: Run scraper
+        shell: bash
+        run: |
+          cat > scrape_jobs.py <<'PY'
+          import csv
+          import re
+          from datetime import datetime, timezone
+
+          import pandas as pd
+          from jobspy import scrape_jobs
+
+          SEARCH_TERMS = [
+              "data analyst",
+              "junior data analyst",
+              "data analyst apprentice",
+              "business intelligence analyst",
+              "bi analyst",
+              "data technician",
+              "reporting analyst",
+              "insights analyst",
+              "insights assistant",
+              "data assistant",
+              "data coordinator",
+              "data administrator",
+              "data support analyst",
+              "mi analyst",
+              "data science trainee",
+              "cyber security technician",
+              "cyber security analyst",
+              "junior cyber security analyst",
+              "security analyst",
+              "junior security analyst",
+              "soc analyst",
+              "soc analyst trainee",
+              "security operations analyst",
+              "information security assistant",
+              "information security analyst",
+              "cyber security trainee",
+              "cyber security apprentice",
+              "it security support assistant",
+              "it security analyst",
+              "risk and compliance assistant",
+              "incident response analyst",
+              "cyber threat analyst",
+          ]
+
+          LOCATIONS = [
+              "Swindon, UK",
+          ]
+
+          ALLOWED_LOCATION_PATTERNS = [
+              r"\bswindon\b",
+              r"\bswindon,\s*uk\b",
+              r"\bswindon,\s*england\b",
+              r"\bswindon,\s*wiltshire\b",
+          ]
+
+          BLOCKED_LOCATION_PATTERNS = [
+              r"\blondon\b",
+              r"\bmanchester\b",
+              r"\bbirmingham\b",
+              r"\bleeds\b",
+              r"\bglasgow\b",
+              r"\bcardiff\b",
+              r"\bnewport\b",
+              r"\bswansea\b",
+              r"\boxford\b",
+              r"\bcambridge\b",
+              r"\bbristol\b",
+              r"\bbath\b",
+              r"\bdevon\b",
+              r"\bliverpool\b",
+              r"\bmerseyside\b",
+              r"\bwiltshire\b",
+              r"\bchippenham\b",
+              r"\bcalne\b",
+              r"\bmelksham\b",
+              r"\btrowbridge\b",
+              r"\bsalisbury\b",
+              r"\breading\b",
+              r"\bremote\b",
+              r"\bhybrid\b",
+              r"\bremote.*uk\b",
+              r"\bunited kingdom\b",
+              r"\buk\b",
+              r"\bengland\b",
+              r"\bsouth west\b",
+              r"\bsouth west england\b",
+          ]
+
+          def normalize_text(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip().lower()
+
+          def classify_work_mode(location_text, title_text=""):
+              combined = f"{normalize_text(location_text)} {normalize_text(title_text)}"
+              if re.search(r"\bremote\b", combined):
+                  return "remote"
+              if re.search(r"\bhybrid\b", combined):
+                  return "hybrid"
+              return "onsite"
+
+          def location_allowed(location_text):
+              text = normalize_text(location_text)
+
+              if not text:
+                  return False
+
+              has_allowed = any(re.search(pattern, text) for pattern in ALLOWED_LOCATION_PATTERNS)
+              has_blocked = any(re.search(pattern, text) for pattern in BLOCKED_LOCATION_PATTERNS)
+
+              if re.search(r"\bswindon\b", text):
+                  if re.search(
+                      r"\b(london|manchester|birmingham|leeds|glasgow|cardiff|newport|swansea|oxford|cambridge|bristol|bath|devon|liverpool|reading|chippenham|calne|melksham|trowbridge|salisbury)\b",
+                      text
+                  ):
+                      return False
+                  return True
+
+              return has_allowed and not has_blocked
+
+          all_frames = []
+
+          for term in SEARCH_TERMS:
+              for location in LOCATIONS:
+                  google_query = f'"{term}" jobs near {location} since 3 days ago'
+
+                  try:
+                      jobs = scrape_jobs(
+                          site_name=["linkedin", "indeed", "google"],
+                          search_term=term,
+                          google_search_term=google_query,
+                          location=location,
+                          results_wanted=40,
+                          hours_old=336,
+                          country_indeed="UK",
+                          linkedin_fetch_description=False,
+                          verbose=1,
+                      )
+
+                      if jobs is not None and len(jobs) > 0:
+                          jobs["search_term"] = term
+                          jobs["search_location"] = location
+                          all_frames.append(jobs)
+
+                  except Exception as e:
+                      print(f"Failed for term={term} location={location}: {e}")
+
+          if all_frames:
+              df = pd.concat(all_frames, ignore_index=True)
+              df.columns = [str(c).lower() for c in df.columns]
+
+              location_col = None
+              for candidate in ["location", "job_location"]:
+                  if candidate in df.columns:
+                      location_col = candidate
+                      break
+
+              title_col = "title" if "title" in df.columns else None
+
+              if location_col:
+                  before_count = len(df)
+                  df = df[df[location_col].apply(location_allowed)].copy()
+                  after_count = len(df)
+                  print(f"Location guardrail removed {before_count - after_count} rows")
+              else:
+                  print("No location column found. Returning empty dataframe for safety.")
+                  df = pd.DataFrame()
+
+              if not df.empty:
+                  if "work_from_home_type" in df.columns:
+                      df["work_mode"] = df["work_from_home_type"].astype(str).str.lower()
+                      df["work_mode"] = df["work_mode"].replace({
+                          "remote": "remote",
+                          "hybrid": "hybrid",
+                          "onsite": "onsite",
+                          "none": "onsite",
+                          "nan": "onsite"
+                      })
+                  else:
+                      df["work_mode"] = df.apply(
+                          lambda row: classify_work_mode(
+                              row[location_col] if location_col else "",
+                              row[title_col] if title_col else ""
+                          ),
+                          axis=1
+                      )
+
+              if not df.empty and "job_url" in df.columns:
+                  df = df.drop_duplicates(subset=["job_url"])
+              elif not df.empty:
+                  dedupe_cols = [c for c in ["site", "title", "company", "location"] if c in df.columns]
+                  if dedupe_cols:
+                      df = df.drop_duplicates(subset=dedupe_cols)
+
+              if not df.empty:
+                  sort_cols = [c for c in ["work_mode", "site", "title", "company"] if c in df.columns]
+                  if sort_cols:
+                      df = df.sort_values(sort_cols).reset_index(drop=True)
+          else:
+              df = pd.DataFrame()
+
+          timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
+
+          df.to_csv(f"jobs_swindon_all_{timestamp}.csv", index=False, quoting=csv.QUOTE_NONNUMERIC, escapechar="\\")
+          df.to_csv("latest_jobs_swindon_all.csv", index=False, quoting=csv.QUOTE_NONNUMERIC, escapechar="\\")
+
+          print(f"Saved {len(df)} total rows")
+          PY
+
+          python scrape_jobs.py
+
+      - name: Upload CSV files
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraped-jobs-csv-swindon
+          path: |
+            latest_jobs_swindon_all.csv
+            jobs_swindon_all_*.csv
