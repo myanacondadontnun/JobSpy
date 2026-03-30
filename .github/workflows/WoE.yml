@@ -115,20 +115,16 @@ jobs:
               has_allowed = any(re.search(pattern, text) for pattern in ALLOWED_LOCATION_PATTERNS)
               has_blocked = any(re.search(pattern, text) for pattern in BLOCKED_LOCATION_PATTERNS)
 
-              # strict rule: must contain one of allowed AND not contain blocked
               return has_allowed and not has_blocked
 
           all_frames = []
 
           for term in SEARCH_TERMS:
               for location in LOCATIONS:
-                  google_query = f'"{term}" jobs near {location} since 3 days ago'
-
                   try:
                       jobs = scrape_jobs(
-                          site_name=["linkedin", "indeed", "google"],
+                          site_name=["linkedin", "indeed"],  # FIXED (no google)
                           search_term=term,
-                          google_search_term=google_query,
                           location=location,
                           results_wanted=40,
                           hours_old=336,
