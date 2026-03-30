@@ -1,9 +1,9 @@
-name: Job scrape Bristol Bath
+name: Job scrape WoE strict
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "15 */6 * * *"
+    - cron: "0 9 */3 * *"
 
 jobs:
   scrape:
@@ -37,12 +37,34 @@ jobs:
           SEARCH_TERMS = [
               "data analyst",
               "junior data analyst",
-              "data science trainee",
+              "data analyst apprentice",
+              "business intelligence analyst",
+              "bi analyst",
               "data technician",
-              "it support analyst",
-              "soc analyst",
+              "reporting analyst",
+              "insights analyst",
+              "data assistant",
+              "data coordinator",
+              "data administrator",
+              "data support analyst",
+              "mi analyst",
+              "data science trainee",
               "cyber security technician",
+              "cyber security analyst",
+              "junior cyber security analyst",
+              "security analyst",
+              "junior security analyst",
+              "soc analyst",
+              "security operations analyst",
+              "information security assistant",
+              "information security analyst",
+              "cyber security trainee",
+              "cyber security apprentice",
+              "it support analyst",
+              "it security analyst",
               "risk and compliance assistant",
+              "incident response analyst",
+              "cyber threat analyst",
           ]
 
           LOCATIONS = [
@@ -50,22 +72,13 @@ jobs:
               "Bath, UK",
           ]
 
-          # Keep only jobs whose location text clearly matches these
           ALLOWED_LOCATION_PATTERNS = [
               r"\bbristol\b",
               r"\bbath\b",
-              r"\bbath,\s*uk\b",
-              r"\bbristol,\s*uk\b",
-              r"\bbristol,\s*england\b",
-              r"\bbath,\s*england\b",
               r"\bsouth gloucestershire\b",
-              r"\bbradley stoke\b",
-              r"\bfilton\b",
-              r"\bclifton\b",
-              r"\bbath and north east somerset\b",
+              r"\bnorth somerset\b",
           ]
 
-          # Remove jobs that mention these places even if Bristol/Bath search caught them
           BLOCKED_LOCATION_PATTERNS = [
               r"\blondon\b",
               r"\bmanchester\b",
@@ -78,9 +91,6 @@ jobs:
               r"\breading\b",
               r"\boxford\b",
               r"\bcambridge\b",
-              r"\bremote.*uk\b",
-              r"\bunited kingdom\b",
-              r"\bengland\b",
           ]
 
           def normalize_text(value):
@@ -88,28 +98,31 @@ jobs:
                   return ""
               return str(value).strip().lower()
 
+          def classify_work_mode(location_text, title_text=""):
+              combined = f"{normalize_text(location_text)} {normalize_text(title_text)}"
+              if re.search(r"\bremote\b", combined):
+                  return "remote"
+              if re.search(r"\bhybrid\b", combined):
+                  return "hybrid"
+              return "onsite"
+
           def location_allowed(location_text):
               text = normalize_text(location_text)
 
               if not text:
                   return False
 
-              included = any(re.search(pattern, text) for pattern in ALLOWED_LOCATION_PATTERNS)
-              blocked = any(re.search(pattern, text) for pattern in BLOCKED_LOCATION_PATTERNS)
+              has_allowed = any(re.search(pattern, text) for pattern in ALLOWED_LOCATION_PATTERNS)
+              has_blocked = any(re.search(pattern, text) for pattern in BLOCKED_LOCATION_PATTERNS)
 
-              # If exact Bristol/Bath style match exists, keep it even if "England" appears.
-              if re.search(r"\b(bristol|bath)\b", text):
-                  if re.search(r"\b(london|manchester|birmingham|leeds|glasgow|cardiff|newport|swansea|reading|oxford|cambridge)\b", text):
-                      return False
-                  return True
-
-              return included and not blocked
+              # strict rule: must contain one of allowed AND not contain blocked
+              return has_allowed and not has_blocked
 
           all_frames = []
 
           for term in SEARCH_TERMS:
               for location in LOCATIONS:
-                  google_query = f'"{term}" jobs near {location} since yesterday'
+                  google_query = f'"{term}" jobs near {location} since 3 days ago'
 
                   try:
                       jobs = scrape_jobs(
@@ -117,8 +130,8 @@ jobs:
                           search_term=term,
                           google_search_term=google_query,
                           location=location,
-                          results_wanted=30,
-                          hours_old=168,
+                          results_wanted=40,
+                          hours_old=336,
                           country_indeed="UK",
                           linkedin_fetch_description=False,
                           verbose=1,
@@ -136,44 +149,47 @@ jobs:
               df = pd.concat(all_frames, ignore_index=True)
               df.columns = [str(c).lower() for c in df.columns]
 
-              # Identify location column safely
               location_col = None
               for candidate in ["location", "job_location"]:
                   if candidate in df.columns:
                       location_col = candidate
                       break
 
+              title_col = "title" if "title" in df.columns else None
+
               if location_col:
-                  before_count = len(df)
+                  before = len(df)
                   df = df[df[location_col].apply(location_allowed)].copy()
-                  after_count = len(df)
-                  print(f"Location guardrail removed {before_count - after_count} rows")
+                  after = len(df)
+                  print(f"Filtered out {before - after} rows")
 
-              # Optional remote guardrail
-              if "is_remote" in df.columns:
-                  df = df[(df["is_remote"] != True) | (df[location_col].apply(location_allowed))].copy()
+              if not df.empty:
+                  if "work_from_home_type" in df.columns:
+                      df["work_mode"] = df["work_from_home_type"].astype(str).str.lower()
+                  else:
+                      df["work_mode"] = df.apply(
+                          lambda row: classify_work_mode(
+                              row[location_col] if location_col else "",
+                              row[title_col] if title_col else ""
+                          ),
+                          axis=1
+                      )
 
-              # De-duplicate
-              if "job_url" in df.columns:
+              if not df.empty and "job_url" in df.columns:
                   df = df.drop_duplicates(subset=["job_url"])
-              else:
-                  dedupe_cols = [c for c in ["site", "title", "company", "location"] if c in df.columns]
-                  if dedupe_cols:
-                      df = df.drop_duplicates(subset=dedupe_cols)
 
-              sort_cols = [c for c in ["site", "search_term", "search_location", "title", "company"] if c in df.columns]
-              if sort_cols:
-                  df = df.sort_values(sort_cols).reset_index(drop=True)
+              if not df.empty:
+                  df = df.sort_values(["work_mode", "site", "title"]).reset_index(drop=True)
+
           else:
               df = pd.DataFrame()
 
           timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
-          output_file = f"jobs_bristol_bath_{timestamp}.csv"
 
-          df.to_csv(output_file, index=False, quoting=csv.QUOTE_NONNUMERIC, escapechar="\\")
-          df.to_csv("latest_jobs.csv", index=False, quoting=csv.QUOTE_NONNUMERIC, escapechar="\\")
+          df.to_csv(f"jobs_woe_all_{timestamp}.csv", index=False, quoting=csv.QUOTE_NONNUMERIC, escapechar="\\")
+          df.to_csv("latest_jobs_woe_all.csv", index=False, quoting=csv.QUOTE_NONNUMERIC, escapechar="\\")
 
-          print(f"Saved {len(df)} rows to {output_file}")
+          print(f"Saved {len(df)} jobs")
           PY
 
           python scrape_jobs.py
@@ -181,7 +197,7 @@ jobs:
       - name: Upload CSV files
         uses: actions/upload-artifact@v4
         with:
-          name: scraped-jobs-csv
+          name: scraped-jobs-csv-woe
           path: |
-            latest_jobs.csv
-            jobs_bristol_bath_*.csv
+            latest_jobs_woe_all.csv
+            jobs_woe_all_*.csv
